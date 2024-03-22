@@ -29,3 +29,5 @@ So, I created a ephemeral chroma database and deleted the files after creating t
 I was wrong. I will check and try to fix the issue.
 
 In case webapp url is not working, please check this one locally.
+
+Also don't forget to add your OpenAI API Key in the .env file in the backend folder.
