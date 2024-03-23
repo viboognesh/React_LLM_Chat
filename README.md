@@ -31,3 +31,16 @@ I was wrong. I will check and try to fix the issue.
 In case webapp url is not working, please check this one locally.
 
 Also don't forget to add your OpenAI API Key in the .env file in the backend folder.
+
+Update:23/03/24 16:30hrs
+
+##The code is fixed for deployment.
+
+The backend doesn't save any files that is uploaded from the users and processes them directly to 
+create conversational_retrieval_chain. I felt this was faster than saving the files.
+
+Additional Features:
+
+The backend also uses session manager to create unique instances of conversational chain for each user.
+It uses cookies to create and manage user_id for accessing conversational_chain.
+It also deletes inactive user_id data regularly on a 10min basis if they have not accessed the app for more than 2hrs.

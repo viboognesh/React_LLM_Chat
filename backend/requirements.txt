@@ -1,11 +1,10 @@
 fastapi
 uvicorn
-sqlalchemy
 langchain_community
 langchain
-pypdf
 langchain_openai
 python-dotenv
 python-multipart
 chromadb
-aiofiles
+PyPDF2
+python-docx

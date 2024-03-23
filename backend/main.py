@@ -1,54 +1,125 @@
-from fastapi import FastAPI, File, UploadFile, Depends
+from fastapi import FastAPI, File, UploadFile, HTTPException, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List
-import os
-import aiofiles
+import uuid
+from datetime import datetime, timedelta
+import asyncio
 
-from dotenv import load_dotenv
+from typing import List, Dict, Any
+from io import BytesIO, StringIO
+from docx import Document
+from langchain.docstore.document import Document as langchain_Document
+from PyPDF2 import PdfReader
+import csv
 
-from langchain_community.document_loaders import TextLoader, Docx2txtLoader, PyPDFLoader
 from langchain.prompts import ChatPromptTemplate, PromptTemplate
 from langchain.prompts import SystemMessagePromptTemplate, HumanMessagePromptTemplate
-from langchain_community.document_loaders.csv_loader import CSVLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.memory import ConversationBufferMemory
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Chroma
 from langchain.chains import ConversationalRetrievalChain
 
+from dotenv import load_dotenv
+
 load_dotenv()
 
-app = FastAPI()
 
-# origins = ["https://viboognesh-react-chat.static.hf.space"]
-origins = ["http://localhost:3000"]
+class Document_Processor:
+    def __init__(self, file_details: List[Dict[Any, str]]):
+        self.file_details = file_details
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
-)
+    def get_docs(self) -> List[langchain_Document]:
+        docs = []
+        for file_detail in self.file_details:
+            if file_detail["name"].endswith(".txt"):
+                docs.extend(self.get_txt_docs(file_detail=file_detail))
 
+            elif file_detail["name"].endswith(".csv"):
+                docs.extend(self.get_csv_docs(file_detail=file_detail))
 
-class ConversationChainManager:
-    _instance = None
+            elif file_detail["name"].endswith(".docx"):
+                docs.extend(self.get_docx_docs(file_detail=file_detail))
 
-    def __new__(cls, *args, **kwargs):
-        if not cls._instance:
-            cls._instance = super(ConversationChainManager, cls).__new__(
-                cls, *args, **kwargs
+            elif file_detail["name"].endswith(".pdf"):
+                docs.extend(self.get_pdf_docs(file_detail=file_detail))
+
+        return docs
+
+    @staticmethod
+    def get_txt_docs(file_detail: Dict[str, Any]) -> List[langchain_Document]:
+        text = file_detail["content"].decode("utf-8")
+        source = file_detail["name"]
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000, chunk_overlap=100
+        )
+        text_docs = text_splitter.create_documents(
+            [text], metadatas=[{"source": source}]
+        )
+        return text_docs
+
+    @staticmethod
+    def get_csv_docs(file_detail: Dict[str, Any]) -> List[langchain_Document]:
+        csv_data = file_detail["content"]
+        source = file_detail["name"]
+        csv_string = csv_data.decode("utf-8")
+        # Use StringIO to create a file-like object from the string
+        csv_file = StringIO(csv_string)
+        csv_reader = csv.DictReader(csv_file)
+        csv_docs = []
+        for row in csv_reader:
+            # Convert each row into a dictionary of key/value pairs
+            page_content = ""
+            for key, value in row.items():
+                page_content += f"{key}: {value}\n"
+            doc = langchain_Document(
+                page_content=page_content, metadata={"source": source}
             )
-        return cls._instance
+            csv_docs.append(doc)
+        return csv_docs
 
-    def __init__(self):
-        self.conversation_chain = None
+    @staticmethod
+    def get_pdf_docs(file_detail: Dict[str, Any]) -> List[langchain_Document]:
+        pdf_content = BytesIO(file_detail["content"])
+        source = file_detail["name"]
+
+        reader = PdfReader(pdf_content)
+        pdf_text = ""
+        for page in reader.pages:
+            pdf_text += page.extract_text() + "\n"
+
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000, chunk_overlap=100
+        )
+        pdf_docs = text_splitter.create_documents(
+            texts=[pdf_text], metadatas=[{"source": source}]
+        )
+        return pdf_docs
+
+    @staticmethod
+    def get_docx_docs(file_detail: Dict[str, Any]) -> List[langchain_Document]:
+        docx_content = BytesIO(file_detail["content"])
+        source = file_detail["name"]
+
+        document = Document(docx_content)
+        docx_text = " ".join([paragraph.text for paragraph in document.paragraphs])
+
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000, chunk_overlap=100
+        )
+        docx_docs = text_splitter.create_documents(
+            [docx_text], metadatas=[{"source": source}]
+        )
+        return docx_docs
+
+
+class Conversational_Chain:
+    def __init__(self, file_details: List[Dict[Any, str]]):
         self.llm_model = ChatOpenAI()
         self.embeddings = OpenAIEmbeddings()
+        self.file_details = file_details
 
-    def create_conversational_chain(self, file_paths: List[str]):
-        docs = self.get_docs(file_paths)
+    def create_conversational_chain(self):
+        docs = Document_Processor(self.file_details).get_docs()
         memory = ConversationBufferMemory(
             memory_key="chat_history", return_messages=True
         )
@@ -57,7 +128,7 @@ class ConversationChainManager:
             self.embeddings,
         )
         retriever = vectordb.as_retriever()
-        self.conversation_chain = ConversationalRetrievalChain.from_llm(
+        conversation_chain = ConversationalRetrievalChain.from_llm(
             llm=self.llm_model,
             retriever=retriever,
             condense_question_prompt=self.get_question_generator_prompt(),
@@ -68,36 +139,7 @@ class ConversationChainManager:
             memory=memory,
         )
 
-    @staticmethod
-    def get_docs(file_paths: List[str]) -> List:
-        docs = []
-        for file_path in file_paths:
-            if file_path.endswith(".txt"):
-                loader = TextLoader(file_path)
-                document = loader.load()
-                splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=1000, chunk_overlap=100
-                )
-                txt_documents = splitter.split_documents(document)
-                docs.extend(txt_documents)
-            elif file_path.endswith(".csv"):
-                loader = CSVLoader(file_path)
-                csv_documents = loader.load()
-                docs.extend(csv_documents)
-            elif file_path.endswith(".docx"):
-                loader = Docx2txtLoader(file_path)
-                document = loader.load()
-                splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=1000, chunk_overlap=100
-                )
-                docx_documents = splitter.split_documents(document)
-                docs.extend(docx_documents)
-            elif file_path.endswith(".pdf"):
-                loader = PyPDFLoader(file_path)
-                pdf_documents = loader.load_and_split()
-                docs.extend(pdf_documents)
-            os.remove(file_path)
-        return docs
+        return conversation_chain
 
     @staticmethod
     def get_document_prompt() -> PromptTemplate:
@@ -143,45 +185,114 @@ class ConversationChainManager:
         return ChatPromptTemplate.from_messages(messages)
 
 
-app.state.conversational_chain_manager = ConversationChainManager()
+class UserSessionManager:
+    def __init__(self):
+        self.sessions = {}
+        self.last_request_time = {}
+
+    def get_session(self, user_id: str):
+        if user_id not in self.sessions:
+            self.sessions[user_id] = None
+            self.last_request_time = datetime.now()
+        return self.sessions[user_id]
+
+    def set_session(self, user_id: str, conversational_chain):
+        self.sessions[user_id] = conversational_chain
+        self.last_request_time[user_id] = datetime.now()
+
+    def delete_inactive_sessions(self, inactive_period: timedelta):
+        current_time = datetime.now()
+        for user_id, last_request_time in list(self.last_request_time.items()):
+            if current_time - last_request_time > inactive_period:
+                del self.sessions[user_id]
+                del self.last_request_time[user_id]
+
+
+app = FastAPI()
+
+origins = ["https://viboognesh-react-chat.static.hf.space"]
+# origins = ["http://localhost:3000"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+user_session_manager = UserSessionManager()
+
+
+@app.middleware("http")
+async def update_last_request_time(request: Request, call_next):
+    user_id = request.cookies.get("user_id")
+    if user_id:
+        user_session_manager.last_request_time[user_id] = datetime.now()
+    response = await call_next(request)
+    return response
+
+
+async def check_inactivity():
+    inactive_period = timedelta(hours=2)
+    while True:
+        await asyncio.sleep(600)
+        user_session_manager.delete_inactive_sessions(inactive_period)
+
+
+app.add_task(check_inactivity())
 
 
 @app.post("/upload_files/")
-async def upload_files(
-    files: List[UploadFile] = File(...),
-    conversation_chain_manager: ConversationChainManager = Depends(
-        lambda: app.state.conversational_chain_manager
-    ),
-):
-    session_folder = f"uploads"
-    os.makedirs(session_folder, exist_ok=True)
-    file_paths = []
-    for file in files:
-        file_path = f"{session_folder}/{file.filename}"
-        async with aiofiles.open(file_path, "wb") as out_file:
+async def upload_files(response: Response, files: List[UploadFile] = File(...)):
+    file_details = []
+    try:
+        for file in files:
             content = await file.read()
-            await out_file.write(content)
-        file_paths.append(file_path)
+            name = f"{file.filename}"
+            details = {"content": content, "name": name}
+            file_details.append(details)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    conversation_chain_manager.create_conversational_chain(file_paths)
-    print("conversational_chain_manager created")
+    user_id = response.cookies.get("user_id")
+    if not user_id:
+        user_id = str(uuid.uuid4())
+        response.set_cookie(key="user_id", value=user_id)
+
+    try:
+        conversational_chain = Conversational_Chain(
+            file_details
+        ).create_conversational_chain()
+        user_session_manager.set_session(
+            user_id=user_id, conversational_chain=conversational_chain
+        )
+        print("conversational_chain_manager created")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
     return {"message": "ConversationalRetrievalChain is created. Please ask questions."}
 
 
 @app.get("/predict/")
-async def predict(
-    query: str,
-    conversation_chain_manager: ConversationChainManager = Depends(
-        lambda: app.state.conversational_chain_manager
-    ),
-):
-    if conversation_chain_manager.conversation_chain is None:
-        system_prompt = "Answer the question and also ask the user to upload files to ask questions from the files.\n"
-        response = conversation_chain_manager.llm_model.invoke(system_prompt + query)
-        answer = response.content
-    else:
-        response = conversation_chain_manager.conversation_chain.invoke(query)
-        answer = response["answer"]
+async def predict(query: str):
+    user_id = response.cookies.get("user_id")
+    if not user_id:
+        user_id = str(uuid.uuid4())
+        response.set_cookie(key="user_id", value=user_id)
+
+    try:
+        conversational_chain = user_session_manager.get_session(user_id=user_id)
+        if conversational_chain is None:
+            system_prompt = "Answer the question and also ask the user to upload files to ask questions from the files.\n"
+            llm_model = ChatOpenAI()
+            response = llm_model.invoke(system_prompt + query)
+            answer = response.content
+        else:
+            response = conversational_chain.invoke(query)
+            answer = response["answer"]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
     print("predict called")
     return {"answer": answer}
